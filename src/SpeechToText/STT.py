@@ -22,7 +22,6 @@ class STT:
         self.buffer = queue.Queue()
         self.running = False
 
-        # CUDA sanity check
         if "cuda" in device and not torch.cuda.is_available():
             print("[STT] ⚠️ CUDA not available, falling back to CPU.")
             self.device = "cpu"
@@ -58,7 +57,6 @@ class STT:
                     chunk = self.buffer.get()
                     audio_data = np.concatenate((audio_data, chunk), axis=0)
 
-                    # Keep rolling window of last N seconds
                     if len(audio_data) > window_seconds * self.samplerate:
                         window = audio_data[-window_seconds * self.samplerate :]
                         segments, _ = self.model.transcribe(
@@ -69,15 +67,12 @@ class STT:
                         text = " ".join([s.text.strip() for s in segments])
                         text = text.strip()
 
-                        # Only print new content
                         if text and text != last_text:
                             print(f"→ {text}")
                             last_text = text
 
-        # Start background transcription thread
         threading.Thread(target=transcriber, daemon=True).start()
 
-        # Start recording stream
         with sd.InputStream(callback=self._audio_callback, channels=1, samplerate=self.samplerate):
             try:
                 while self.running:

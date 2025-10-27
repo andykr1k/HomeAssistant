@@ -1,0 +1,37 @@
+# Ignore the Git repository and related files
+.git
+.gitignore
+LICENSE
+README.md
+
+# Ignore Node.js dependencies
+node_modules/
+
+# Ignore Python virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Ignore build artifacts and temporary files
+build/
+dist/
+target/
+*.log
+*.tmp
+
+# Ignore sensitive environment variables or configuration files
+.env
+.env.*
+secrets.txt
+
+# Ignore documentation files
+docs/
+*.md
+
+# Exclude all files in a specific directory, but re-include a specific file within it
+/special/*
+!/special/only-docker.txt
+
+# Ignore files with a specific extension in any directory
+**/*.class

@@ -1,7 +1,7 @@
 uvicorn
-numpy<2
+numpy
 piper_tts
 sounddevice
 faster-whisper
-torch==2.7.1
+torch
 fastapi

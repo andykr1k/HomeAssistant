@@ -1,0 +1,14 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: homeassistant
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/code
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python src/main.py
+    restart: unless-stopped

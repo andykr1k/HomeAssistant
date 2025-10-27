@@ -1,10 +1,10 @@
-from SpeechToText.STT import STT
-from TextToSpeech.TTS import TTS
-from VisionLanguageModel.VLM import VLM
-from Tools.Tools import Tools
-from State.State import State
+# from SpeechToText.STT import STT
+# from TextToSpeech.TTS import TTS
+# from VisionLanguageModel.VLM import VLM
+# from Tools.Tools import Tools
+# from State.State import State
+# from Tracking.Tracking import Tracking
 from API.API import API
-from Tracking.Tracking import Tracking
 
 class HomeAssistant:
     """
@@ -14,13 +14,15 @@ class HomeAssistant:
     def __init__(self):
         # Initialize each subsystem
         print("[HomeAssistant] Initializing subsystems...")
-        self.stt = STT(model_size="small", device="cuda:0")
-        self.tts = TTS()
-        self.vlm = VLM()
-        self.tools = Tools()
-        self.state = State()
+        # self.stt = STT(model_size="small", device="cuda:0")
+        # self.tts = TTS()
+        # self.vlm = VLM()
+        # self.tools = Tools()
+        # self.state = State()
+        # self.tracking = Tracking()
         self.api = API()
-        self.tracking = Tracking()
+
+        self.api.run()
         print("[HomeAssistant] All systems initialized successfully.")
 
     def run(self):
@@ -33,7 +35,7 @@ class HomeAssistant:
         try:
             response =  "Welcome Home Andy!"
             print(f"[HomeAssistant] Assistant: {response}")
-            self.tts.speak(response)
+            # self.tts.speak(response)
 
         except KeyboardInterrupt:
             print("\n[HomeAssistant] Interrupted by user.")
