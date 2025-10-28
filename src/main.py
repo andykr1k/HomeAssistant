@@ -1,10 +1,11 @@
 # from SpeechToText.STT import STT
-# from TextToSpeech.TTS import TTS
+from TextToSpeech.TTS import TTS
 # from VisionLanguageModel.VLM import VLM
 # from Tools.Tools import Tools
 # from State.State import State
 # from Tracking.Tracking import Tracking
 from API.API import API
+import threading
 
 class HomeAssistant:
     """
@@ -14,15 +15,17 @@ class HomeAssistant:
     def __init__(self):
         # Initialize each subsystem
         print("[HomeAssistant] Initializing subsystems...")
-        # self.stt = STT(model_size="small", device="cuda:0")
-        # self.tts = TTS()
+        # self.stt = STT()
+        self.tts = TTS()
         # self.vlm = VLM()
         # self.tools = Tools()
         # self.state = State()
         # self.tracking = Tracking()
         self.api = API()
 
-        self.api.run()
+        # Start the API in a separate thread
+        self.api_thread = threading.Thread(target=self.api.run, daemon=True)
+        self.api_thread.start()
         print("[HomeAssistant] All systems initialized successfully.")
 
     def run(self):
@@ -35,7 +38,7 @@ class HomeAssistant:
         try:
             response =  "Welcome Home Andy!"
             print(f"[HomeAssistant] Assistant: {response}")
-            # self.tts.speak(response)
+            self.tts.speak(response)
 
         except KeyboardInterrupt:
             print("\n[HomeAssistant] Interrupted by user.")

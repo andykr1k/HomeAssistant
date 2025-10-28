@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     build-essential \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    apt install -y portaudio19-dev
 
 COPY requirements.txt .
 
