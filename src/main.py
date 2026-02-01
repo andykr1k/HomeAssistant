@@ -8,6 +8,7 @@ from pathlib import Path
 from API.API import API
 from Display.Display import Display
 from LLM.Router import LLMRouter
+from Memory.manager import MemoryManager
 from SpeechToText.STT import STT
 from State.State import State
 from TextToSpeech.TTS import TTS
@@ -22,6 +23,7 @@ class HomeAssistant:
         self._boot_order = [
             "Environment",
             "State",
+            "Memory",
             "Tools",
             "LLM",
             "STT",
@@ -44,6 +46,11 @@ class HomeAssistant:
         self.state.subscribe(self._on_state_update)
         self._boot_update("State", "ready")
 
+        self._boot_update("Memory", "loading")
+        self.memory = MemoryManager(debug=self._debug)
+        self._boot_update("Memory", "ready" if self.memory.enabled else "disabled")
+        self.state.update_subsystem_status("memory", bool(self.memory.enabled))
+
         self.tools = Tools(state=self.state, debug=self._debug)
         self._boot_update("Tools", "ready")
         self._boot_update("Browser", "ready" if self.tools.browser_available() else "disabled")
@@ -52,6 +59,8 @@ class HomeAssistant:
         self.router = self._init_router()
         self._boot_update("LLM", "ready" if self.router else "error")
         self.state.update_subsystem_status("llm", bool(self.router))
+        if self.router and self.memory and self.memory.enabled:
+            self.memory.set_summarizer(self.router.build_summarizer())
 
         self._busy_lock = threading.Lock()
         self._speaking = False
@@ -148,6 +157,8 @@ class HomeAssistant:
 
             self.state.update(mode="thinking", last_user_text=clean_text, caption=f"Heard: {display_text}")
             response = self._generate_response(clean_text)
+            if self.memory and self.memory.enabled:
+                self.memory.record_turn(display_text, response, source=source)
             if response:
                 self.state.update(mode="speaking", last_assistant_text=response, caption=response)
                 self._speak(response)
@@ -232,7 +243,7 @@ class HomeAssistant:
 
     def _init_router(self) -> Optional[LLMRouter]:
         try:
-            router = LLMRouter(self.tools, debug=self._debug)
+            router = LLMRouter(self.tools, memory=self.memory, debug=self._debug)
             if router.enabled():
                 return router
             return None

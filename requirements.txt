@@ -11,3 +11,4 @@ icalendar
 recurring-ical-events
 transformers
 accelerate
+sentence-transformers

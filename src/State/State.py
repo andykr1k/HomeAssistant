@@ -35,6 +35,7 @@ class State:
                 "stt": None,
                 "tts": None,
                 "camera": None,
+                "memory": None,
             },
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }

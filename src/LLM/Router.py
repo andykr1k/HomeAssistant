@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -97,10 +98,14 @@ class TransformersBackend(LLMBackend):
 
 
 class LLMRouter:
-    def __init__(self, tools, debug: bool = False) -> None:
+    def __init__(self, tools, memory=None, debug: bool = False) -> None:
         self._tools = tools
+        self._memory = memory
         self._debug = debug
         self._logger = logging.getLogger(__name__)
+        self._llm_lock = threading.Lock()
+        self._memory_max_chars = int(os.getenv("MEMORY_MAX_CHARS", "1500"))
+        self._memory_tool_max_chars = int(os.getenv("MEMORY_TOOL_MAX_CHARS", "700"))
         self._backend = self._init_backend()
 
     def enabled(self) -> bool:
@@ -157,6 +162,8 @@ class LLMRouter:
     def _tool_call(self, text: str) -> List[ToolCall]:
         tool_specs = self._tools.tool_specs()
         now = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+        memory_context = self._memory_context(text, max_chars=self._memory_tool_max_chars)
+        memory_block = f"Memory context:\n{memory_context}\n\n" if memory_context else ""
         system_prompt = (
             "You are a tool router for a local Jarvis assistant.\n"
             "Return ONLY valid JSON. No markdown, no commentary.\n"
@@ -164,13 +171,14 @@ class LLMRouter:
         )
         user_prompt = (
             f"Current date/time: {now}\n"
+            f"{memory_block}"
             f"User message: {text}\n\n"
             "Available tools (name, description, arguments schema):\n"
             f"{json.dumps(tool_specs, indent=2)}\n\n"
             "Return JSON in the form:\n"
             "{\"tool_calls\": [{\"name\": \"tool_name\", \"arguments\": {}}]}"
         )
-        raw = self._backend.generate(
+        raw = self._generate(
             system_prompt,
             user_prompt,
             temperature=float(os.getenv("LLM_TOOL_TEMPERATURE", "0.0")),
@@ -191,6 +199,8 @@ class LLMRouter:
         now = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
         if tool_results and all(item.get("silent") for item in tool_results):
             return ""
+        memory_context = self._memory_context(text, max_chars=self._memory_max_chars)
+        memory_block = f"Memory context:\n{memory_context}\n\n" if memory_context else ""
         system_prompt = (
             "You are Jarvis, a concise, confident home assistant.\n"
             "Respond naturally to the user. Use tool results when provided.\n"
@@ -198,11 +208,12 @@ class LLMRouter:
         )
         user_prompt = (
             f"Current date/time: {now}\n"
+            f"{memory_block}"
             f"User message: {text}\n"
             f"Tool results (JSON): {json.dumps(tool_results, indent=2)}\n\n"
             "Answer the user in one or two sentences."
         )
-        raw = self._backend.generate(
+        raw = self._generate(
             system_prompt,
             user_prompt,
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
@@ -227,6 +238,55 @@ class LLMRouter:
             dtype=dtype,
             trust_remote_code=trust_remote_code,
         )
+
+    def _generate(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
+        if not self._backend:
+            return ""
+        with self._llm_lock:
+            return self._backend.generate(system_prompt, user_prompt, **kwargs)
+
+    def _memory_context(self, text: str, max_chars: int) -> str:
+        if not self._memory or not getattr(self._memory, "enabled", False):
+            return ""
+        try:
+            context = self._memory.build_context(text, max_chars=max_chars) or ""
+            if self._debug and context:
+                self._logger.debug("Memory context injected len=%s", len(context))
+            return context
+        except Exception as exc:
+            if self._debug:
+                self._logger.debug("Memory context unavailable: %s", exc)
+            return ""
+
+    def build_summarizer(self):
+        if not self._backend:
+            return None
+
+        def summarizer(previous_summary: str, new_turns: str, max_chars: int) -> str:
+            now = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+            system_prompt = (
+                "You update a long-term memory summary for a personal assistant.\n"
+                "Keep it concise, factual, and useful for future responses.\n"
+                "Exclude short-lived details and avoid speculation.\n"
+                "Return only the updated summary text.\n"
+            )
+            summary_text = previous_summary.strip() if previous_summary else "None"
+            user_prompt = (
+                f"Current date/time: {now}\n"
+                f"Existing summary:\n{summary_text}\n\n"
+                f"New conversation turns:\n{new_turns}\n\n"
+                f"Updated summary (max {max_chars} characters):"
+            )
+            max_tokens = max(128, int(max_chars / 4))
+            raw = self._generate(
+                system_prompt,
+                user_prompt,
+                temperature=0.2,
+                max_tokens=max_tokens,
+            )
+            return raw.strip()
+
+        return summarizer
 
     @staticmethod
     def _parse_json(raw: str) -> Dict[str, Any]:

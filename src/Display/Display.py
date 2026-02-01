@@ -441,6 +441,7 @@ class Display:
             ("stt", "STT"),
             ("tts", "TTS"),
             ("camera", "CAMERA"),
+            ("memory", "MEMORY"),
         ]:
             row = tk.Frame(self._device_frame, bg="#000000")
             row.pack(anchor="w", pady=2)
