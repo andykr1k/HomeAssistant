@@ -367,6 +367,11 @@ class HomeAssistant:
             snapshot.get("code_text", ""),
             snapshot.get("code_title", "Code"),
         )
+        self.display.set_terminal_overlay(
+            bool(snapshot.get("terminal_visible")),
+            snapshot.get("terminal_text", ""),
+            snapshot.get("terminal_title", "Terminal"),
+        )
         self.display.set_device_statuses(snapshot.get("subsystem_status", {}))
 
 

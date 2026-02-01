@@ -30,6 +30,9 @@ class State:
             "code_visible": False,
             "code_title": "",
             "code_text": "",
+            "terminal_visible": False,
+            "terminal_title": "",
+            "terminal_text": "",
             "subsystem_status": {
                 "llm": None,
                 "stt": None,

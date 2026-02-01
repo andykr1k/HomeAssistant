@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
 import logging
 import os
+import re
+import shlex
+import shutil
+import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
@@ -399,6 +403,137 @@ class CalendarService:
             self._cache[range_name] = (time.time(), items)
 
 
+class WindowPlacement:
+    """Compute external window placement using X11 monitor geometry."""
+
+    def __init__(self, debug: bool = False) -> None:
+        self._debug = debug
+        self._logger = logging.getLogger(__name__)
+        self._target_monitor = os.getenv("EXTERNAL_TARGET_MONITOR", "").strip()
+        self._scale = self._parse_float(os.getenv("EXTERNAL_WINDOW_SCALE", "0.7"), 0.7)
+
+    def geometry(self, scale_override: Optional[float] = None) -> Dict[str, int]:
+        override = self._override_geometry()
+        if override:
+            return override
+
+        monitors = self._read_monitors()
+        if not monitors:
+            return {"x": 0, "y": 0, "width": 1280, "height": 720}
+
+        monitor = self._select_monitor(monitors)
+        scale = scale_override if scale_override is not None else self._scale
+        width = max(240, int(monitor["width"] * scale))
+        height = max(180, int(monitor["height"] * scale))
+        x = monitor["x"] + max((monitor["width"] - width) // 2, 0)
+        y = monitor["y"] + max((monitor["height"] - height) // 2, 0)
+        return {"x": x, "y": y, "width": width, "height": height}
+
+    def _override_geometry(self) -> Optional[Dict[str, int]]:
+        raw_x = os.getenv("EXTERNAL_WINDOW_X")
+        raw_y = os.getenv("EXTERNAL_WINDOW_Y")
+        raw_w = os.getenv("EXTERNAL_WINDOW_WIDTH")
+        raw_h = os.getenv("EXTERNAL_WINDOW_HEIGHT")
+        if raw_x is None or raw_y is None or raw_w is None or raw_h is None:
+            return None
+        try:
+            return {
+                "x": int(raw_x),
+                "y": int(raw_y),
+                "width": int(raw_w),
+                "height": int(raw_h),
+            }
+        except ValueError:
+            return None
+
+    def _read_monitors(self) -> List[Dict[str, int]]:
+        if not shutil.which("xrandr"):
+            return []
+        try:
+            result = subprocess.run(
+                ["xrandr", "--listmonitors"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return []
+        lines = result.stdout.splitlines()
+        monitors = []
+        for line in lines[1:]:
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            index_raw = parts[0].rstrip(":")
+            flags = parts[1]
+            primary = "*" in flags
+            name = parts[-1]
+            geometry_token = None
+            for token in parts:
+                if "x" in token and "+" in token and "/" in token:
+                    geometry_token = token
+                    break
+            if not geometry_token:
+                continue
+            match = re.search(r"(\\d+)\\/\\d+x(\\d+)\\/\\d+\\+(\\d+)\\+(\\d+)", geometry_token)
+            if not match:
+                continue
+            try:
+                index = int(index_raw)
+                width, height, x, y = [int(value) for value in match.groups()]
+            except ValueError:
+                continue
+            monitors.append(
+                {
+                    "index": index,
+                    "name": name,
+                    "primary": primary,
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                }
+            )
+        return monitors
+
+    def _select_monitor(self, monitors: List[Dict[str, int]]) -> Dict[str, int]:
+        target = self._target_monitor
+        if target:
+            if target.lower() == "primary":
+                for monitor in monitors:
+                    if monitor.get("primary"):
+                        return monitor
+            elif target.isdigit():
+                idx = int(target)
+                for monitor in monitors:
+                    if monitor["index"] == idx:
+                        return monitor
+                if 1 <= idx <= len(monitors):
+                    return monitors[idx - 1]
+                for monitor in monitors:
+                    if monitor["name"].endswith(target):
+                        return monitor
+            else:
+                for monitor in monitors:
+                    if monitor["name"] == target:
+                        return monitor
+                for monitor in monitors:
+                    if target.lower() in monitor["name"].lower():
+                        return monitor
+        for monitor in monitors:
+            if monitor.get("primary"):
+                return monitor
+        return monitors[0]
+
+    @staticmethod
+    def _parse_float(raw: str, fallback: float) -> float:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+
 class BrowserService:
     """System browser controller."""
 
@@ -406,6 +541,26 @@ class BrowserService:
         self._state = state
         self._debug = debug
         self._logger = logging.getLogger(__name__)
+        self._external_enabled = os.getenv("BROWSER_EXTERNAL_ENABLE", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._external_bin = os.getenv("BROWSER_EXTERNAL_BIN", "google-chrome").strip()
+        self._external_args = os.getenv("BROWSER_EXTERNAL_ARGS", "").strip()
+        self._external_scale = self._parse_optional_float(os.getenv("BROWSER_EXTERNAL_SCALE", ""))
+        self._external_wmclass = os.getenv("BROWSER_EXTERNAL_WMCLASS", "google-chrome").strip()
+        self._external_position = os.getenv("BROWSER_EXTERNAL_POSITION", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._external_position_timeout = self._parse_optional_float(
+            os.getenv("BROWSER_EXTERNAL_POSITION_TIMEOUT", "4")
+        ) or 4.0
+        self._placement = WindowPlacement(debug=debug)
+        self._wmctrl = shutil.which("wmctrl")
+        self._window_id: Optional[str] = None
 
     @property
     def available(self) -> bool:
@@ -414,10 +569,15 @@ class BrowserService:
     def open_url(self, url: str, title: str = "Browser") -> ToolResult:
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
-        try:
-            webbrowser.open(url)
-        except Exception as exc:
-            return ToolResult(ok=False, message=f"Browser failed: {exc}")
+        if self._external_enabled:
+            result = self._open_external(url)
+            if not result.ok:
+                return result
+        else:
+            try:
+                webbrowser.open(url)
+            except Exception as exc:
+                return ToolResult(ok=False, message=f"Browser failed: {exc}")
         if self._state:
             # Hide overlay when using the system browser.
             self._state.update(browser_visible=False, browser_url=url, browser_title=title)
@@ -450,6 +610,872 @@ class BrowserService:
             ok=False,
             message="Clicking results requires the embedded browser. Open the page manually.",
         )
+
+    def _open_external(self, url: str) -> ToolResult:
+        binary = self._external_bin or "google-chrome"
+        if not self._binary_available(binary):
+            return ToolResult(ok=False, message=f"Browser binary not found: {binary}")
+        geometry = self._placement.geometry(scale_override=self._external_scale)
+        existing_ids = self._list_window_ids() if self._wmctrl else []
+        if self._window_id and self._window_alive(self._window_id):
+            if self._wmctrl:
+                self._activate_window(self._window_id)
+            args = [binary, "--new-tab"]
+            if self._external_args:
+                args.extend(shlex.split(self._external_args))
+            args.append(url)
+            try:
+                subprocess.Popen(args)
+            except Exception as exc:
+                return ToolResult(ok=False, message=f"Browser failed: {exc}")
+            if self._wmctrl and self._external_position:
+                self._position_window_id(self._window_id, geometry)
+            return ToolResult(ok=True, message="Opened.", data={"url": url}, silent=True)
+
+        args = [
+            binary,
+            "--new-window",
+            f"--window-position={geometry['x']},{geometry['y']}",
+            f"--window-size={geometry['width']},{geometry['height']}",
+        ]
+        if self._external_args:
+            args.extend(shlex.split(self._external_args))
+        args.append(url)
+        try:
+            subprocess.Popen(args)
+        except Exception as exc:
+            return ToolResult(ok=False, message=f"Browser failed: {exc}")
+        if self._wmctrl and self._external_position:
+            self._window_id = self._capture_window_id(existing_ids)
+            if self._window_id:
+                self._position_window_id(self._window_id, geometry)
+        return ToolResult(ok=True, message="Opened.", data={"url": url}, silent=True)
+
+    @staticmethod
+    def _binary_available(binary: str) -> bool:
+        if not binary:
+            return False
+        if os.path.isabs(binary):
+            return os.path.exists(binary)
+        return bool(shutil.which(binary))
+
+    def _list_window_ids(self) -> List[str]:
+        if not self._wmctrl:
+            return []
+        try:
+            result = subprocess.run(
+                [self._wmctrl, "-lx"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return []
+        ids = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 3:
+                continue
+            window_id = parts[0]
+            wmclass = parts[2]
+            if self._external_wmclass.lower() in wmclass.lower():
+                ids.append(window_id)
+        return ids
+
+    def _capture_window_id(self, existing_ids: List[str]) -> Optional[str]:
+        if not self._wmctrl:
+            return None
+        deadline = time.time() + max(self._external_position_timeout, 1.0)
+        window_id = None
+        while time.time() < deadline:
+            current_ids = self._list_window_ids()
+            new_ids = [item for item in current_ids if item not in existing_ids]
+            if new_ids:
+                window_id = new_ids[-1]
+                break
+            if current_ids:
+                window_id = current_ids[-1]
+            time.sleep(0.2)
+        return window_id
+
+    def _position_window_id(self, window_id: str, geometry: Dict[str, int]) -> None:
+        if not self._wmctrl or not window_id:
+            return
+        try:
+            subprocess.run(
+                [
+                    self._wmctrl,
+                    "-i",
+                    "-r",
+                    window_id,
+                    "-b",
+                    "remove,maximized_vert,maximized_horz",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            subprocess.run(
+                [
+                    self._wmctrl,
+                    "-i",
+                    "-r",
+                    window_id,
+                    "-e",
+                    f"0,{geometry['x']},{geometry['y']},{geometry['width']},{geometry['height']}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            subprocess.run(
+                [self._wmctrl, "-i", "-a", window_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return
+
+    def _activate_window(self, window_id: str) -> None:
+        if not self._wmctrl or not window_id:
+            return
+        try:
+            subprocess.run(
+                [self._wmctrl, "-i", "-a", window_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return
+
+    def _window_alive(self, window_id: str) -> bool:
+        if not self._wmctrl or not window_id:
+            return False
+        try:
+            result = subprocess.run(
+                [self._wmctrl, "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return False
+        for line in result.stdout.splitlines():
+            if line.split(None, 1)[0] == window_id:
+                return True
+        return False
+
+    @staticmethod
+    def _parse_optional_float(raw: str) -> Optional[float]:
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+
+class TerminalService:
+    """Tool-driven terminal output runner."""
+
+    def __init__(self, state, debug: bool = False) -> None:
+        self._state = state
+        self._debug = debug
+        self._logger = logging.getLogger(__name__)
+        self._enabled = os.getenv("TERMINAL_ENABLE", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._default_cwd = os.getenv("TERMINAL_CWD", "").strip()
+        self._prompt = os.getenv("TERMINAL_PROMPT", "$").strip() or "$"
+        self._timeout = int(os.getenv("TERMINAL_TIMEOUT_SECONDS", "12"))
+        self._max_chars = int(os.getenv("TERMINAL_MAX_CHARS", "12000"))
+        self._blocked = self._build_blocklist()
+
+    @property
+    def available(self) -> bool:
+        return self._enabled
+
+    def open(self, title: str = "Terminal") -> ToolResult:
+        if not self.available:
+            return self._disabled_result()
+        if self._state:
+            self._state.update(terminal_visible=True, terminal_title=title)
+        return ToolResult(ok=True, message="Opened.", silent=True)
+
+    def close(self) -> ToolResult:
+        if not self.available:
+            return self._disabled_result()
+        if self._state:
+            self._state.update(terminal_visible=False, terminal_title="")
+        return ToolResult(ok=True, message="Closed.", silent=True)
+
+    def clear(self, title: str = "Terminal") -> ToolResult:
+        if not self.available:
+            return self._disabled_result()
+        if self._state:
+            self._state.update(terminal_visible=True, terminal_title=title, terminal_text="")
+        return ToolResult(ok=True, message="Cleared.", silent=True)
+
+    def run(self, command: str, cwd: Optional[str] = None, title: str = "Terminal") -> ToolResult:
+        if not self.available:
+            return self._disabled_result()
+        cmd = (command or "").strip()
+        if not cmd:
+            return ToolResult(ok=False, message="Command is empty.")
+        run_cwd = (cwd or self._default_cwd).strip() or os.getcwd()
+        safe, reason = self._is_command_safe(cmd)
+        if not safe:
+            entry = self._format_blocked_entry(cmd, run_cwd, reason or "Command blocked for safety.")
+            self._append_entry(entry, title)
+            return ToolResult(ok=False, message=reason or "Command blocked for safety.")
+        start = time.time()
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=run_cwd,
+                capture_output=True,
+                text=True,
+                timeout=max(self._timeout, 1),
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            entry = self._format_entry(cmd, run_cwd, output, result.returncode, timed_out=False)
+        except subprocess.TimeoutExpired as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            entry = self._format_entry(cmd, run_cwd, output, None, timed_out=True)
+        except Exception as exc:
+            entry = self._format_entry(cmd, run_cwd, str(exc), None, timed_out=False, errored=True)
+
+        self._append_entry(entry, title)
+        elapsed = time.time() - start
+        message = f"Command finished in {elapsed:.1f}s."
+        return ToolResult(ok=True, message=message, silent=True)
+
+    def _build_blocklist(self) -> List[Dict[str, str]]:
+        return [
+            {"pattern": r":\(\)\s*\{:\|:&\};:", "reason": "Fork bomb blocked."},
+            {"pattern": r"\brm\s+-rf\s+/\s*$", "reason": "Refusing to remove root."},
+            {"pattern": r"\brm\s+-rf\s+/\s", "reason": "Refusing to remove root."},
+            {"pattern": r"\brm\s+-rf\s+/\*", "reason": "Refusing to remove root."},
+            {"pattern": r"\brm\s+-rf\s+~\b", "reason": "Refusing to remove home."},
+            {"pattern": r"\brm\s+-rf\s+--no-preserve-root\b", "reason": "Refusing to remove root."},
+            {"pattern": r"\bmkfs(\.|\\s|$)", "reason": "Refusing to format disks."},
+            {"pattern": r"\bdd\s+if=", "reason": "Refusing to run disk imaging command."},
+            {"pattern": r"\b(shutdown|reboot|poweroff|halt)\b", "reason": "Refusing to power off."},
+            {"pattern": r"\binit\s+0\b", "reason": "Refusing to power off."},
+            {"pattern": r"\bkill\s+-9\s+1\b", "reason": "Refusing to kill init."},
+            {"pattern": r"\bchown\s+-r\s+/\b", "reason": "Refusing to change ownership on root."},
+            {"pattern": r"\bchmod\s+-r\s+/\b", "reason": "Refusing to change permissions on root."},
+        ]
+
+    def _is_command_safe(self, command: str) -> tuple[bool, Optional[str]]:
+        lowered = command.lower()
+        for entry in self._blocked:
+            if re.search(entry["pattern"], lowered):
+                return False, entry["reason"]
+        return True, None
+
+    def _append_text(self, existing: str, entry: str) -> str:
+        combined = f"{existing}{entry}"
+        if len(combined) <= self._max_chars:
+            return combined
+        trimmed = combined[-self._max_chars :]
+        return f"... (truncated)\n{trimmed}"
+
+    def _append_entry(self, entry: str, title: str) -> None:
+        if not self._state:
+            return
+        snapshot = self._state.snapshot()
+        existing = snapshot.get("terminal_text", "") or ""
+        combined = self._append_text(existing, entry)
+        self._state.update(
+            terminal_visible=True,
+            terminal_title=title,
+            terminal_text=combined,
+        )
+
+    def _format_blocked_entry(self, command: str, cwd: str, reason: str) -> str:
+        prompt = f"{self._prompt} "
+        header = f"{prompt}{command}  ({cwd})\n"
+        body = reason.rstrip()
+        if body:
+            body = body + "\n"
+        return f"{header}{body}[blocked]\n\n"
+
+    def _format_entry(
+        self,
+        command: str,
+        cwd: str,
+        output: str,
+        exit_code: Optional[int],
+        timed_out: bool,
+        errored: bool = False,
+    ) -> str:
+        prompt = f"{self._prompt} "
+        header = f"{prompt}{command}  ({cwd})\n"
+        if errored:
+            status = "error"
+        elif timed_out:
+            status = "timeout"
+        else:
+            status = f"exit {exit_code}" if exit_code is not None else "exit ?"
+        body = output.rstrip()
+        if body:
+            body = body + "\n"
+        return f"{header}{body}[{status}]\n\n"
+
+    def _disabled_result(self) -> ToolResult:
+        message = "Terminal disabled. Set TERMINAL_ENABLE=true and restart."
+        self._append_entry(f"{message}\n\n", "Terminal")
+        return ToolResult(ok=False, message=message)
+
+
+class TerminalExternalService:
+    """Open a system terminal window (optionally running a command)."""
+
+    def __init__(self, debug: bool = False) -> None:
+        self._debug = debug
+        self._logger = logging.getLogger(__name__)
+        self._enabled = os.getenv("TERMINAL_EXTERNAL_ENABLE", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._binary = os.getenv("TERMINAL_EXTERNAL_BIN", "gnome-terminal").strip()
+        self._args = os.getenv("TERMINAL_EXTERNAL_ARGS", "").strip()
+        self._exec_flag = os.getenv("TERMINAL_EXTERNAL_EXEC_FLAG", "-e").strip() or "-e"
+        self._template = os.getenv("TERMINAL_EXTERNAL_COMMAND_TEMPLATE", "").strip()
+        self._hold_open = os.getenv("TERMINAL_EXTERNAL_HOLD", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._scale = self._parse_optional_float(os.getenv("TERMINAL_EXTERNAL_SCALE", ""))
+        self._wmclass = os.getenv("TERMINAL_EXTERNAL_WMCLASS", "terminal").strip() or "terminal"
+        self._title = os.getenv("TERMINAL_EXTERNAL_TITLE", "Jarvis Terminal").strip()
+        self._tmux_enabled = os.getenv("TERMINAL_EXTERNAL_TMUX", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._tmux_session = os.getenv(
+            "TERMINAL_EXTERNAL_TMUX_SESSION", "jarvis-terminal"
+        ).strip()
+        self._position_timeout = self._parse_float(
+            os.getenv("TERMINAL_EXTERNAL_POSITION_TIMEOUT", "4"), 4.0
+        )
+        self._placement = WindowPlacement(debug=debug)
+        self._wmctrl = shutil.which("wmctrl")
+        self._tmux = shutil.which("tmux")
+        self._window_id: Optional[str] = None
+        if not self._tmux:
+            self._tmux_enabled = False
+
+    @property
+    def available(self) -> bool:
+        return self._enabled
+
+    def open(self, command: Optional[str] = None) -> ToolResult:
+        if not self.available:
+            return ToolResult(ok=False, message="External terminal not enabled.")
+        if not self._binary_available(self._binary):
+            return ToolResult(ok=False, message=f"Terminal binary not found: {self._binary}")
+        if self._tmux_enabled and not self._ensure_tmux_session():
+            return ToolResult(ok=False, message="Terminal tmux session failed.")
+
+        if self._window_id and self._window_alive(self._window_id):
+            if self._wmctrl:
+                self._activate_window(self._window_id)
+                self._position_window_id(self._window_id)
+            if command:
+                if self._tmux_enabled:
+                    return self._tmux_send(command)
+                return self._spawn_with_command(command)
+            return ToolResult(ok=True, message="Opened.", silent=True)
+
+        result = self._spawn_terminal_window()
+        if not result.ok:
+            return result
+        if command:
+            if self._tmux_enabled:
+                return self._tmux_send(command)
+            return self._spawn_with_command(command)
+        return result
+
+    def run(self, command: str) -> ToolResult:
+        return self.open(command=command)
+
+    def _command_args(self, command: Optional[str]) -> List[str]:
+        if not command:
+            return []
+        command = command.strip()
+        if not command:
+            return []
+
+        if self._hold_open:
+            command = f"{command}; exec bash"
+
+        if self._template:
+            tokens = shlex.split(self._template)
+            rendered = []
+            for token in tokens:
+                rendered.append(token.replace("{command}", command))
+            return rendered
+
+        flag = self._exec_flag.strip()
+        if not flag or flag == "--":
+            return ["--", "bash", "-lc", command]
+        return [flag, "bash", "-lc", command]
+
+    def _spawn_terminal_window(self) -> ToolResult:
+        if not self._binary_available(self._binary):
+            return ToolResult(ok=False, message=f"Terminal binary not found: {self._binary}")
+        existing_ids = self._list_window_ids() if self._wmctrl else []
+        args = [self._binary]
+        if self._args:
+            args.extend(shlex.split(self._args))
+        if self._title:
+            args.extend(["--title", self._title])
+        if self._tmux_enabled:
+            attach_command = f"tmux attach -t {self._tmux_session}"
+            args.extend(self._command_args(attach_command))
+        try:
+            subprocess.Popen(args)
+        except Exception as exc:
+            return ToolResult(ok=False, message=f"Terminal failed: {exc}")
+
+        if self._wmctrl:
+            self._window_id = self._capture_window_id(existing_ids)
+            if self._window_id:
+                self._position_window_id(self._window_id)
+        else:
+            return ToolResult(
+                ok=True,
+                message="Opened. Install wmctrl to position the window.",
+                silent=False,
+            )
+        return ToolResult(ok=True, message="Opened.", silent=True)
+
+    def _spawn_with_command(self, command: str) -> ToolResult:
+        args = [self._binary]
+        if self._args:
+            args.extend(shlex.split(self._args))
+        if self._title:
+            args.extend(["--title", self._title])
+        args.extend(self._command_args(command))
+        try:
+            subprocess.Popen(args)
+        except Exception as exc:
+            return ToolResult(ok=False, message=f"Terminal failed: {exc}")
+        return ToolResult(ok=True, message="Opened.", silent=True)
+
+    def _ensure_tmux_session(self) -> bool:
+        if not self._tmux:
+            return False
+        try:
+            result = subprocess.run(
+                [self._tmux, "has-session", "-t", self._tmux_session],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return False
+        if result.returncode == 0:
+            return True
+        try:
+            subprocess.run(
+                [self._tmux, "new-session", "-d", "-s", self._tmux_session],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return False
+        return True
+
+    def _tmux_send(self, command: str) -> ToolResult:
+        if not self._tmux or not self._ensure_tmux_session():
+            return ToolResult(ok=False, message="tmux not available.")
+        cmd = command.strip()
+        if not cmd:
+            return ToolResult(ok=False, message="Command is empty.")
+        try:
+            subprocess.run(
+                [self._tmux, "send-keys", "-t", self._tmux_session, cmd, "C-m"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception as exc:
+            return ToolResult(ok=False, message=f"tmux send failed: {exc}")
+        return ToolResult(ok=True, message="Command sent.", silent=True)
+
+    def _list_window_ids(self) -> List[str]:
+        if not self._wmctrl:
+            return []
+        try:
+            result = subprocess.run(
+                [self._wmctrl, "-lx"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return []
+        ids = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 3:
+                continue
+            window_id = parts[0]
+            wmclass = parts[2]
+            if self._wmclass.lower() in wmclass.lower():
+                ids.append(window_id)
+        return ids
+
+    def _capture_window_id(self, existing_ids: List[str]) -> Optional[str]:
+        if not self._wmctrl:
+            return None
+        deadline = time.time() + max(self._position_timeout, 1.0)
+        window_id = None
+        while time.time() < deadline:
+            current_ids = self._list_window_ids()
+            new_ids = [item for item in current_ids if item not in existing_ids]
+            if new_ids:
+                window_id = new_ids[-1]
+                break
+            if current_ids:
+                window_id = current_ids[-1]
+            time.sleep(0.2)
+        return window_id
+
+    def _position_window_id(self, window_id: str) -> None:
+        if not self._wmctrl or not window_id:
+            return
+        geometry = self._placement.geometry(scale_override=self._scale)
+        try:
+            subprocess.run(
+                [
+                    self._wmctrl,
+                    "-i",
+                    "-r",
+                    window_id,
+                    "-b",
+                    "remove,maximized_vert,maximized_horz",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            subprocess.run(
+                [
+                    self._wmctrl,
+                    "-i",
+                    "-r",
+                    window_id,
+                    "-e",
+                    f"0,{geometry['x']},{geometry['y']},{geometry['width']},{geometry['height']}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            subprocess.run(
+                [self._wmctrl, "-i", "-a", window_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return
+
+    def _activate_window(self, window_id: str) -> None:
+        if not self._wmctrl or not window_id:
+            return
+        try:
+            subprocess.run(
+                [self._wmctrl, "-i", "-a", window_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return
+
+    def _window_alive(self, window_id: str) -> bool:
+        if not self._wmctrl or not window_id:
+            return False
+        try:
+            result = subprocess.run(
+                [self._wmctrl, "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return False
+        for line in result.stdout.splitlines():
+            if line.split(None, 1)[0] == window_id:
+                return True
+        return False
+
+    @staticmethod
+    def _binary_available(binary: str) -> bool:
+        if not binary:
+            return False
+        if os.path.isabs(binary):
+            return os.path.exists(binary)
+        return bool(shutil.which(binary))
+
+    @staticmethod
+    def _parse_optional_float(raw: str) -> Optional[float]:
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_float(raw: str, fallback: float) -> float:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+
+class CodeExternalService:
+    """Open VS Code in an external window and optionally position it."""
+
+    def __init__(self, debug: bool = False) -> None:
+        self._debug = debug
+        self._logger = logging.getLogger(__name__)
+        self._enabled = os.getenv("CODE_EXTERNAL_ENABLE", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._binary = os.getenv("CODE_EXTERNAL_BIN", "code").strip() or "code"
+        self._args = os.getenv("CODE_EXTERNAL_ARGS", "").strip()
+        self._scale = self._parse_optional_float(os.getenv("CODE_EXTERNAL_SCALE", ""))
+        self._wmclass = os.getenv("CODE_EXTERNAL_WMCLASS", "code").strip() or "code"
+        self._position_timeout = self._parse_float(
+            os.getenv("CODE_EXTERNAL_POSITION_TIMEOUT", "4"), 4.0
+        )
+        self._placement = WindowPlacement(debug=debug)
+        self._wmctrl = shutil.which("wmctrl")
+        self._window_id: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return self._enabled
+
+    def open(self, path: Optional[str] = None) -> ToolResult:
+        if not self.available:
+            return ToolResult(ok=False, message="VS Code external not enabled.")
+        if not self._binary_available(self._binary):
+            return ToolResult(ok=False, message=f"VS Code binary not found: {self._binary}")
+        if self._window_id and self._window_alive(self._window_id):
+            if path:
+                args = [self._binary, "--reuse-window"]
+                if self._args:
+                    args.extend(shlex.split(self._args))
+                args.append(path)
+                try:
+                    subprocess.Popen(args)
+                except Exception:
+                    pass
+            if self._wmctrl:
+                self._activate_window(self._window_id)
+                self._position_window_id(self._window_id)
+            return ToolResult(ok=True, message="Opened.", silent=True)
+
+        existing_ids = self._list_window_ids() if self._wmctrl else []
+        args = [self._binary, "--new-window"]
+        if self._args:
+            args.extend(shlex.split(self._args))
+        if path:
+            args.append(path)
+        try:
+            subprocess.Popen(args)
+        except Exception as exc:
+            return ToolResult(ok=False, message=f"VS Code failed: {exc}")
+
+        if not self._wmctrl:
+            return ToolResult(
+                ok=True,
+                message="Opened. Install wmctrl to position the window.",
+                silent=False,
+            )
+
+        self._window_id = self._capture_window_id(existing_ids)
+        if not self._window_id:
+            return ToolResult(
+                ok=True,
+                message="Opened. Could not position the window.",
+                silent=False,
+            )
+        self._position_window_id(self._window_id)
+        return ToolResult(ok=True, message="Opened.", silent=True)
+
+    def _list_window_ids(self) -> List[str]:
+        if not self._wmctrl:
+            return []
+        try:
+            result = subprocess.run(
+                [self._wmctrl, "-lx"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return []
+        ids = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 3:
+                continue
+            window_id = parts[0]
+            wmclass = parts[2]
+            if self._wmclass.lower() in wmclass.lower():
+                ids.append(window_id)
+        return ids
+
+    def _capture_window_id(self, existing_ids: List[str]) -> Optional[str]:
+        if not self._wmctrl:
+            return None
+        deadline = time.time() + max(self._position_timeout, 1.0)
+        window_id = None
+        while time.time() < deadline:
+            current_ids = self._list_window_ids()
+            new_ids = [item for item in current_ids if item not in existing_ids]
+            if new_ids:
+                window_id = new_ids[-1]
+                break
+            if current_ids:
+                window_id = current_ids[-1]
+            time.sleep(0.2)
+        return window_id
+
+    def _position_window_id(self, window_id: str) -> None:
+        if not self._wmctrl or not window_id:
+            return
+        geometry = self._placement.geometry(scale_override=self._scale)
+        try:
+            subprocess.run(
+                [
+                    self._wmctrl,
+                    "-i",
+                    "-r",
+                    window_id,
+                    "-b",
+                    "remove,maximized_vert,maximized_horz",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            subprocess.run(
+                [
+                    self._wmctrl,
+                    "-i",
+                    "-r",
+                    window_id,
+                    "-e",
+                    f"0,{geometry['x']},{geometry['y']},{geometry['width']},{geometry['height']}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            subprocess.run(
+                [self._wmctrl, "-i", "-a", window_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return
+
+    def _activate_window(self, window_id: str) -> None:
+        if not self._wmctrl or not window_id:
+            return
+        try:
+            subprocess.run(
+                [self._wmctrl, "-i", "-a", window_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return
+
+    def _window_alive(self, window_id: str) -> bool:
+        if not self._wmctrl or not window_id:
+            return False
+        try:
+            result = subprocess.run(
+                [self._wmctrl, "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return False
+        for line in result.stdout.splitlines():
+            if line.split(None, 1)[0] == window_id:
+                return True
+        return False
+
+    @staticmethod
+    def _binary_available(binary: str) -> bool:
+        if not binary:
+            return False
+        if os.path.isabs(binary):
+            return os.path.exists(binary)
+        return bool(shutil.which(binary))
+
+    @staticmethod
+    def _parse_optional_float(raw: str) -> Optional[float]:
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_float(raw: str, fallback: float) -> float:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return fallback
 
 
 class CameraStatusService:
@@ -560,8 +1586,21 @@ class Tools:
         self._weather = WeatherService(state, debug=debug) if state else None
         self._calendar = CalendarService(state, debug=debug) if state else None
         self._browser = BrowserService(state, debug=debug) if state else None
+        self._terminal = TerminalService(state, debug=debug) if state else None
+        self._terminal_external = TerminalExternalService(debug=debug) if state else None
+        self._code_external = CodeExternalService(debug=debug) if state else None
         self._camera_status = CameraStatusService(state, debug=debug) if state else None
         self._tool_registry = self._build_tool_registry()
+        self._terminal_external_prefer = os.getenv("TERMINAL_EXTERNAL_PREFER", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._code_external_prefer = os.getenv("CODE_EXTERNAL_PREFER", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
 
         if self._debug:
             self._logger.debug(
@@ -607,6 +1646,9 @@ class Tools:
 
     def browser_available(self) -> bool:
         return bool(self._browser and self._browser.available)
+
+    def terminal_available(self) -> bool:
+        return bool(self._terminal and self._terminal.available)
 
     def tool_specs(self) -> List[Dict[str, Any]]:
         return [
@@ -747,6 +1789,9 @@ class Tools:
         return self._browser.close()
 
     def code_open(self, path: Optional[str] = None, title: str = "Code") -> ToolResult:
+        if self._code_external and self._code_external.available and self._code_external_prefer:
+            target = (path or self._code_default or self._projects_root or "").strip() or None
+            return self._code_external.open(path=target)
         target = (path or self._code_default or "").strip()
         root = self._resolve_code_root()
         target_path = None
@@ -791,6 +1836,49 @@ class Tools:
         if self._state:
             self._state.update(code_visible=False, code_title="", code_text="")
         return ToolResult(ok=True, message="Closed.", silent=True)
+
+    def code_open_external(self, path: Optional[str] = None) -> ToolResult:
+        if not self._code_external:
+            return ToolResult(ok=False, message="VS Code external not available.")
+        return self._code_external.open(path=path)
+
+    def terminal_open(self, title: str = "Terminal") -> ToolResult:
+        if self._terminal_external and self._terminal_external.available and self._terminal_external_prefer:
+            return self._terminal_external.open()
+        if not self._terminal:
+            return ToolResult(ok=False, message="Terminal not available.")
+        return self._terminal.open(title=title)
+
+    def terminal_close(self) -> ToolResult:
+        if not self._terminal:
+            return ToolResult(ok=False, message="Terminal not available.")
+        return self._terminal.close()
+
+    def terminal_clear(self, title: str = "Terminal") -> ToolResult:
+        if self._terminal_external and self._terminal_external.available and self._terminal_external_prefer:
+            return self._terminal_external.open()
+        if not self._terminal:
+            return ToolResult(ok=False, message="Terminal not available.")
+        return self._terminal.clear(title=title)
+
+    def terminal_run(
+        self, command: str, cwd: Optional[str] = None, title: str = "Terminal"
+    ) -> ToolResult:
+        if self._terminal_external and self._terminal_external.available and self._terminal_external_prefer:
+            return self._terminal_external.run(command=command)
+        if not self._terminal:
+            return ToolResult(ok=False, message="Terminal not available.")
+        return self._terminal.run(command=command, cwd=cwd, title=title)
+
+    def terminal_open_external(self, command: Optional[str] = None) -> ToolResult:
+        if not self._terminal_external:
+            return ToolResult(ok=False, message="External terminal not available.")
+        return self._terminal_external.open(command=command)
+
+    def terminal_run_external(self, command: str) -> ToolResult:
+        if not self._terminal_external:
+            return ToolResult(ok=False, message="External terminal not available.")
+        return self._terminal_external.run(command=command)
 
     @staticmethod
     def _is_within_root(path: Path, root: Path) -> bool:
@@ -986,6 +2074,65 @@ class Tools:
                 "description": "Close the code overlay.",
                 "schema": {"type": "object", "properties": {}},
                 "handler": self.code_close,
+            },
+            "code_open_external": {
+                "description": "Open a project, file, or directory in a VS Code window on the same monitor.",
+                "schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+                "handler": self.code_open_external,
+            },
+            "terminal_open": {
+                "description": "Open the terminal overlay.",
+                "schema": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                },
+                "handler": self.terminal_open,
+            },
+            "terminal_close": {
+                "description": "Close the terminal overlay.",
+                "schema": {"type": "object", "properties": {}},
+                "handler": self.terminal_close,
+            },
+            "terminal_clear": {
+                "description": "Clear terminal output.",
+                "schema": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                },
+                "handler": self.terminal_clear,
+            },
+            "terminal_run": {
+                "description": "Run a shell command and display output in the terminal overlay.",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "cwd": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+                "handler": self.terminal_run,
+            },
+            "terminal_open_external": {
+                "description": "Open a system terminal window on the same monitor.",
+                "schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+                "handler": self.terminal_open_external,
+            },
+            "terminal_run_external": {
+                "description": "Run a command in a system terminal window on the same monitor.",
+                "schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+                "handler": self.terminal_run_external,
             },
         }
 

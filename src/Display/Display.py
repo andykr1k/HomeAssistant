@@ -64,6 +64,7 @@ class Display:
         self._build_boot()
         self._build_browser_overlay()
         self._build_code_overlay()
+        self._build_terminal_overlay()
 
         self._mode = "idle"
         self._border_phase = 0.0
@@ -197,6 +198,23 @@ class Display:
                 self._code_frame.lift()
             else:
                 self._code_frame.place_forget()
+
+        self._run_on_ui(apply)
+
+    def set_terminal_overlay(
+        self, visible: bool, text: str = "", title: str = "Terminal"
+    ) -> None:
+        def apply():
+            if visible:
+                self._terminal_title.config(text=title)
+                self._terminal_text.configure(state="normal")
+                self._terminal_text.delete("1.0", tk.END)
+                self._terminal_text.insert("1.0", text)
+                self._terminal_text.configure(state="disabled")
+                self._terminal_frame.place(relx=0.5, rely=0.5, anchor="center")
+                self._terminal_frame.lift()
+            else:
+                self._terminal_frame.place_forget()
 
         self._run_on_ui(apply)
 
@@ -473,7 +491,7 @@ class Display:
             font=("SF Pro Display", 18, "normal"),
             wraplength=self._width * 0.6,
         )
-        self._caption_label.place(relx=0.5, rely=0.62, anchor="center")
+        self._caption_label.place(relx=0.5, rely=0.86, anchor="center")
 
     def _build_boot(self) -> None:
         """Boot status overlay."""
@@ -607,6 +625,50 @@ class Display:
         )
         self._code_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
         self._code_text.configure(state="disabled")
+
+    def _build_terminal_overlay(self) -> None:
+        """Overlay for terminal output."""
+        width = int(self._width * 0.8)
+        height = int(self._height * 0.6)
+
+        self._terminal_frame = tk.Frame(
+            self._root,
+            bg="#05070A",
+            highlightthickness=2,
+            highlightbackground="#FFD43B",
+        )
+        self._terminal_frame.place_forget()
+        self._terminal_frame.configure(width=width, height=height)
+        self._terminal_frame.pack_propagate(False)
+
+        self._terminal_title = tk.Label(
+            self._terminal_frame,
+            text="Terminal",
+            fg="#FFE066",
+            bg="#05070A",
+            font=("SF Pro Display", 14, "bold"),
+        )
+        self._terminal_title.pack(anchor="nw", padx=12, pady=(10, 6))
+
+        text_frame = tk.Frame(self._terminal_frame, bg="#05070A")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        self._terminal_text = tk.Text(
+            text_frame,
+            bg="#06090F",
+            fg="#E6F2FF",
+            insertbackground="#E6F2FF",
+            font=("SF Mono", 12, "normal"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+        )
+        self._terminal_text.pack(side="left", fill=tk.BOTH, expand=True)
+        self._terminal_text.configure(state="disabled")
+
+        scrollbar = tk.Scrollbar(text_frame, command=self._terminal_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._terminal_text.configure(yscrollcommand=scrollbar.set)
 
     def _set_border_visible(self, visible: bool) -> None:
         """Show or hide the rainbow border."""
