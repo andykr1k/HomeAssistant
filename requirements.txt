@@ -6,3 +6,8 @@ faster-whisper
 torch
 fastapi
 requests
+python-dotenv
+icalendar
+recurring-ical-events
+transformers
+accelerate

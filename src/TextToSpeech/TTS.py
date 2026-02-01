@@ -1,3 +1,4 @@
+import logging
 import os
 import piper
 from piper import PiperVoice
@@ -11,8 +12,10 @@ except ImportError:
 
 
 class TTS:
-    def __init__(self, model_name: str = "us-ryan-medium/en_US-ryan-medium.onnx"):
+    def __init__(self, model_name: str = "us-ryan-medium/en_US-ryan-medium.onnx", debug: bool = False):
         """Initialize TTS with a Piper model."""
+        self._debug = debug
+        self._logger = logging.getLogger(__name__)
         volume = 1.0
         length = 1.25
         
@@ -31,6 +34,8 @@ class TTS:
             normalize_audio=False,
         )
         
+        if self._debug:
+            self._logger.debug("TTS config model=%s volume=%s length=%s", model_name, volume, length)
         print(f"[TTS] Loaded model: {model_name}")
     
     def synthesize_to_file(self, text: str, output_path: str = "output.wav", **kwargs):
@@ -68,6 +73,8 @@ class TTS:
         stream.start()
         
         try:
+            if self._debug:
+                self._logger.debug("TTS speaking text length=%s", len(text))
             print(f"[TTS] Speaking: {text}")
             audio_chunks = self.voice.synthesize(text, syn_config=self._voiceConfig, **kwargs)
             
